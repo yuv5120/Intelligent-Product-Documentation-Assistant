@@ -44,7 +44,7 @@ User Query → FastAPI → Retriever → ChromaDB (Vector Search)
 
 1. **Clone or navigate to the project directory**:
 ```bash
-cd /Users/yuvraj/Desktop/Intelligent-Product-Documentation-Assistant
+
 ```
 
 2. **Create and activate a virtual environment**:
