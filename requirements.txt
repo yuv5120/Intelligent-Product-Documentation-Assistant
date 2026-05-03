@@ -15,13 +15,20 @@ markdown==3.5.2
 
 # LLM Integration
 openai==1.57.4
-langchain==0.3.13
-langchain-community==0.3.13
 
 # Data Validation & Utilities
 pydantic==2.10.4
 pydantic-settings==2.7.0
 python-dotenv==1.0.1
+
+# Observability — structured JSON logging
+python-json-logger==2.0.7
+
+# Rate Limiting
+slowapi==0.1.9
+
+# Session Storage (Redis backend — optional, falls back to in-memory)
+redis[hiredis]==5.2.1
 
 # Testing
 pytest==8.3.4

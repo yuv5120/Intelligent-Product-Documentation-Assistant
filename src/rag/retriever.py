@@ -1,8 +1,10 @@
 """
-Retriever with semantic search and reranking.
+Retriever with semantic search and cross-encoder reranking.
+Reranking model is configurable via settings.rerank_model.
 """
 
 from typing import List, Dict, Tuple
+
 from sentence_transformers import CrossEncoder
 
 from src.vector_db.chroma_client import ChromaClient
@@ -14,126 +16,102 @@ logger = setup_logger(__name__)
 
 class Retriever:
     """
-    Semantic retrieval with cross-encoder reranking for improved accuracy.
+    Two-stage retrieval:
+      1. Dense vector search via ChromaDB (high recall)
+      2. Cross-encoder reranking (high precision)
     """
-    
+
     def __init__(
         self,
         chroma_client: ChromaClient = None,
-        rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        rerank_model: str = None,
     ):
         """
-        Initialize the retriever.
-        
         Args:
-            chroma_client: ChromaDB client instance
-            rerank_model: Cross-encoder model for reranking
+            chroma_client: Injected ChromaDB client.
+            rerank_model: Cross-encoder model name (default: from settings).
         """
         self.chroma_client = chroma_client or ChromaClient()
-        
-        logger.info(f"Loading reranking model: {rerank_model}")
-        self.reranker = CrossEncoder(rerank_model)
-        
-        logger.info("Retriever initialized successfully")
-    
+        model_name = rerank_model or settings.rerank_model
+
+        logger.info("Loading reranking model", extra={"model": model_name})
+        self.reranker = CrossEncoder(model_name)
+        logger.info("Retriever ready")
+
     def retrieve(
         self,
         query: str,
         top_k: int = None,
         top_n: int = None,
-        include_scores: bool = True
+        include_scores: bool = True,
     ) -> List[Dict]:
         """
-        Retrieve relevant documents with reranking.
-        
+        Retrieve and rerank relevant documents.
+
         Args:
-            query: Search query
-            top_k: Number of initial candidates (default from config)
-            top_n: Number of final results after reranking (default from config)
-            include_scores: Whether to include relevance scores
-            
+            query: Search query.
+            top_k: Initial candidates from vector search (default: settings).
+            top_n: Final documents after reranking (default: settings).
+            include_scores: Whether to include rerank_score in output.
+
         Returns:
-            List of document dictionaries with text, metadata, and scores
+            List of document dicts: {text, metadata, rerank_score, original_rank}
         """
         if top_k is None:
             top_k = settings.top_k_retrieval
         if top_n is None:
             top_n = settings.top_n_rerank
-        
-        logger.info(f"Retrieving documents for query: '{query}'")
-        
-        # Step 1: Initial vector search
+
+        logger.info("Retrieving", extra={"query": query[:80], "top_k": top_k, "top_n": top_n})
+
+        # Stage 1: vector search
         search_results = self.chroma_client.search(query, top_k=top_k)
-        
-        if not search_results['documents']:
+        if not search_results["documents"]:
             logger.warning("No documents found in vector search")
             return []
-        
-        # Step 2: Rerank using cross-encoder
-        logger.info(f"Reranking {len(search_results['documents'])} candidates")
-        
-        # Prepare query-document pairs for reranking
-        pairs = [[query, doc] for doc in search_results['documents']]
-        
-        # Get reranking scores
+
+        # Stage 2: cross-encoder reranking
+        pairs = [[query, doc] for doc in search_results["documents"]]
         rerank_scores = self.reranker.predict(pairs)
-        
-        # Combine results with scores
-        combined = []
-        for idx, (doc, metadata, score) in enumerate(zip(
-            search_results['documents'],
-            search_results['metadatas'],
-            rerank_scores
-        )):
-            combined.append({
-                'text': doc,
-                'metadata': metadata,
-                'rerank_score': float(score),
-                'original_rank': idx
-            })
-        
-        # Sort by rerank score (descending)
-        combined.sort(key=lambda x: x['rerank_score'], reverse=True)
-        
-        # Take top N
+
+        combined = [
+            {
+                "text": doc,
+                "metadata": metadata,
+                "rerank_score": float(score),
+                "original_rank": idx,
+            }
+            for idx, (doc, metadata, score) in enumerate(
+                zip(search_results["documents"], search_results["metadatas"], rerank_scores)
+            )
+        ]
+
+        combined.sort(key=lambda x: x["rerank_score"], reverse=True)
         top_results = combined[:top_n]
-        
-        logger.info(f"Retrieved {len(top_results)} documents after reranking")
-        
-        # Format results
+
         if not include_scores:
-            for result in top_results:
-                result.pop('rerank_score', None)
-                result.pop('original_rank', None)
-        
+            for r in top_results:
+                r.pop("rerank_score", None)
+                r.pop("original_rank", None)
+
+        logger.info("Retrieval complete", extra={"returned": len(top_results)})
         return top_results
-    
+
     def retrieve_with_citations(
         self,
         query: str,
         top_k: int = None,
-        top_n: int = None
+        top_n: int = None,
     ) -> Tuple[List[Dict], List[str]]:
         """
-        Retrieve documents and format citations.
-        
-        Args:
-            query: Search query
-            top_k: Number of initial candidates
-            top_n: Number of final results
-            
+        Retrieve documents and return formatted citation strings alongside them.
+
         Returns:
-            Tuple of (documents, formatted_citations)
+            Tuple of (documents, formatted_citation_strings)
         """
         results = self.retrieve(query, top_k=top_k, top_n=top_n)
-        
-        citations = []
-        for idx, result in enumerate(results, 1):
-            metadata = result['metadata']
-            filename = metadata.get('filename', 'Unknown')
-            chunk_idx = metadata.get('chunk_index', 0)
-            
-            citation = f"[{idx}] {filename} (chunk {chunk_idx})"
-            citations.append(citation)
-        
+        citations = [
+            f"[{idx}] {r['metadata'].get('filename', 'Unknown')} (chunk {r['metadata'].get('chunk_index', 0)})"
+            for idx, r in enumerate(results, 1)
+        ]
         return results, citations

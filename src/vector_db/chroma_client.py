@@ -1,10 +1,12 @@
 """
 ChromaDB client for vector storage and similarity search.
+Document IDs use UUID4 to prevent collisions on concurrent uploads.
 """
 
+import uuid
 from typing import List, Dict, Optional
+
 import chromadb
-from chromadb.config import Settings as ChromaSettings
 
 from src.config import settings
 from src.embeddings.embedding_model import EmbeddingModel
@@ -18,166 +20,145 @@ class ChromaClient:
     Wrapper for ChromaDB vector database operations.
     Handles document indexing and similarity search.
     """
-    
+
     def __init__(
         self,
         collection_name: str = "product_docs",
-        persist_directory: str = None
+        persist_directory: str = None,
     ):
         """
-        Initialize ChromaDB client.
-        
         Args:
-            collection_name: Name of the collection to use
-            persist_directory: Directory to persist the database
+            collection_name: ChromaDB collection name.
+            persist_directory: Persistence directory (default: from settings).
         """
         self.collection_name = collection_name
         self.persist_directory = persist_directory or settings.chroma_persist_dir
-        
-        logger.info(f"Initializing ChromaDB at: {self.persist_directory}")
-        
-        # Initialize ChromaDB client with persistence
-        self.client = chromadb.PersistentClient(
-            path=self.persist_directory
-        )
-        
-        # Initialize embedding model
+
+        logger.info("Initialising ChromaDB", extra={"path": self.persist_directory})
+
+        self.client = chromadb.PersistentClient(path=self.persist_directory)
         self.embedding_model = EmbeddingModel()
-        
-        # Get or create collection
+
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}  # Use cosine similarity
+            metadata={"hnsw:space": "cosine"},
         )
-        
+
         logger.info(
-            f"ChromaDB initialized. Collection: {self.collection_name}, "
-            f"Documents: {self.collection.count()}"
+            "ChromaDB ready",
+            extra={
+                "collection": self.collection_name,
+                "document_count": self.collection.count(),
+            },
         )
-    
+
+    # ── Write ─────────────────────────────────────────────────────────────────
+
     def add_documents(
         self,
         texts: List[str],
         metadatas: List[Dict] = None,
-        ids: List[str] = None
+        ids: List[str] = None,
     ) -> None:
         """
-        Add documents to the vector database.
-        
+        Index documents into the vector database.
+
         Args:
-            texts: List of text chunks to add
-            metadatas: List of metadata dictionaries for each chunk
-            ids: Optional list of IDs (auto-generated if not provided)
+            texts: Text chunks to embed and store.
+            metadatas: Metadata dict per chunk.
+            ids: Optional explicit IDs. When omitted, UUID4 values are
+                 generated — this is the safe default and avoids collisions
+                 that sequential counter IDs produce after deletions.
         """
         if not texts:
-            logger.warning("No texts provided to add_documents")
+            logger.warning("add_documents called with empty text list")
             return
-        
-        # Generate IDs if not provided
+
+        # Always use UUID4 unless the caller provides explicit IDs
         if ids is None:
-            start_id = self.collection.count()
-            ids = [f"doc_{start_id + i}" for i in range(len(texts))]
-        
-        # Generate embeddings
-        logger.info(f"Generating embeddings for {len(texts)} documents")
+            ids = [str(uuid.uuid4()) for _ in texts]
+
+        logger.info("Generating embeddings", extra={"count": len(texts)})
         embeddings = self.embedding_model.embed_batch(texts)
-        
-        # Add to collection
-        logger.info(f"Adding {len(texts)} documents to ChromaDB")
+
         self.collection.add(
             documents=texts,
             embeddings=embeddings,
             metadatas=metadatas,
-            ids=ids
+            ids=ids,
         )
-        
+
         logger.info(
-            f"Successfully added {len(texts)} documents. "
-            f"Total documents: {self.collection.count()}"
+            "Documents indexed",
+            extra={"added": len(texts), "total": self.collection.count()},
         )
-    
+
+    # ── Read ──────────────────────────────────────────────────────────────────
+
     def search(
         self,
         query: str,
         top_k: int = None,
-        filter_metadata: Dict = None
+        filter_metadata: Dict = None,
     ) -> Dict:
         """
-        Search for similar documents using semantic search.
-        
+        Semantic similarity search.
+
         Args:
-            query: Search query text
-            top_k: Number of results to return (default from config)
-            filter_metadata: Optional metadata filter
-            
+            query: Free-text query.
+            top_k: Number of results (default: from settings).
+            filter_metadata: Optional ChromaDB where-filter.
+
         Returns:
-            Dictionary with documents, metadatas, and distances
+            dict with keys: documents, metadatas, distances, ids
         """
         if top_k is None:
             top_k = settings.top_k_retrieval
-        
-        logger.info(f"Searching for: '{query}' (top_k={top_k})")
-        
-        # Generate query embedding
+
+        logger.info("Vector search", extra={"query": query[:80], "top_k": top_k})
+
         query_embedding = self.embedding_model.embed_text(query)
-        
-        # Search in ChromaDB
+
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
-            where=filter_metadata
+            where=filter_metadata,
         )
-        
-        # Format results
-        formatted_results = {
-            'documents': results['documents'][0] if results['documents'] else [],
-            'metadatas': results['metadatas'][0] if results['metadatas'] else [],
-            'distances': results['distances'][0] if results['distances'] else [],
-            'ids': results['ids'][0] if results['ids'] else []
+
+        return {
+            "documents": results["documents"][0] if results["documents"] else [],
+            "metadatas": results["metadatas"][0] if results["metadatas"] else [],
+            "distances": results["distances"][0] if results["distances"] else [],
+            "ids": results["ids"][0] if results["ids"] else [],
         }
-        
-        logger.info(f"Found {len(formatted_results['documents'])} results")
-        
-        return formatted_results
-    
+
+    def get_count(self) -> int:
+        """Return the total number of indexed chunks."""
+        return self.collection.count()
+
+    # ── Delete ────────────────────────────────────────────────────────────────
+
     def clear_collection(self) -> None:
-        """Delete all documents from the collection."""
-        logger.warning(f"Clearing collection: {self.collection_name}")
-        
-        # Delete the collection
+        """Delete all documents and recreate the collection."""
+        logger.warning("Clearing collection", extra={"collection": self.collection_name})
         self.client.delete_collection(name=self.collection_name)
-        
-        # Recreate empty collection
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine"},
         )
-        
-        logger.info("Collection cleared successfully")
-    
-    def get_count(self) -> int:
-        """
-        Get the number of documents in the collection.
-        
-        Returns:
-            Document count
-        """
-        return self.collection.count()
-    
+        logger.info("Collection cleared")
+
     def delete_by_metadata(self, metadata_filter: Dict) -> None:
         """
-        Delete documents matching metadata filter.
-        
+        Delete documents matching a metadata filter.
+
         Args:
-            metadata_filter: Metadata filter to match documents
+            metadata_filter: ChromaDB where-filter dict.
         """
-        logger.info(f"Deleting documents with filter: {metadata_filter}")
-        
-        # This is a limitation of ChromaDB - we need to query first, then delete
+        logger.info("Deleting by metadata", extra={"filter": metadata_filter})
         results = self.collection.get(where=metadata_filter)
-        
-        if results['ids']:
-            self.collection.delete(ids=results['ids'])
-            logger.info(f"Deleted {len(results['ids'])} documents")
+        if results["ids"]:
+            self.collection.delete(ids=results["ids"])
+            logger.info("Documents deleted", extra={"count": len(results["ids"])})
         else:
-            logger.info("No documents matched the filter")
+            logger.info("No documents matched deletion filter")

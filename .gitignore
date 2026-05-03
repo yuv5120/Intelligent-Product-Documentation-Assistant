@@ -52,3 +52,9 @@ htmlcov/
 
 # Uploaded documents (optional)
 uploaded_docs/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+frontend/.env.*.local

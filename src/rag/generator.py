@@ -1,9 +1,10 @@
 """
 LLM-based answer generator with context assembly.
+All generation parameters are pulled from settings — no magic numbers.
 """
 
+import asyncio
 from typing import List, Dict, Optional
-import os
 
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -14,244 +15,193 @@ logger = setup_logger(__name__)
 class Generator:
     """
     Generate answers using LLM with retrieved context.
-    Supports both OpenAI and local Ollama models.
+    Supports OpenAI and Ollama backends.
+    LLM calls are wrapped in run_in_executor so they don't block
+    FastAPI's async event loop.
     """
-    
+
     def __init__(self, model_type: str = None):
         """
-        Initialize the generator.
-        
         Args:
-            model_type: 'openai' or 'ollama' (default from config)
+            model_type: 'openai' or 'ollama' (default: from settings)
         """
         self.model_type = model_type or settings.model_type
-        
-        logger.info(f"Initializing generator with model type: {self.model_type}")
-        
+        logger.info("Initialising generator", extra={"model_type": self.model_type})
+
         if self.model_type == "openai":
             self._init_openai()
         elif self.model_type == "ollama":
             self._init_ollama()
         else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
-    
-    def _init_openai(self):
-        """Initialize OpenAI client."""
+            raise ValueError(f"Unsupported model type: {self.model_type!r}. Choose 'openai' or 'ollama'.")
+
+    # ── Initialisation ────────────────────────────────────────────────────────
+
+    def _init_openai(self) -> None:
+        """Initialise the OpenAI client."""
         try:
             from openai import OpenAI
-            
-            api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
-            
+
+            api_key = settings.openai_api_key
             if not api_key:
-                logger.warning(
-                    "No OpenAI API key found. Set OPENAI_API_KEY environment variable."
-                )
+                logger.warning("No OPENAI_API_KEY configured — OpenAI calls will fail.")
                 self.client = None
             else:
                 self.client = OpenAI(api_key=api_key)
-                self.model_name = "gpt-3.5-turbo"
-                logger.info(f"OpenAI client initialized with model: {self.model_name}")
-        
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI: {e}")
+                self.model_name = settings.openai_model
+                logger.info("OpenAI client ready", extra={"model": self.model_name})
+        except Exception as exc:
+            logger.error("OpenAI init failed", extra={"error": str(exc)})
             self.client = None
-    
-    def _init_ollama(self):
-        """Initialize Ollama client."""
+
+    def _init_ollama(self) -> None:
+        """Verify Ollama connectivity and store connection config."""
+        import requests
+
+        base_url = settings.ollama_base_url
         try:
-            # Ollama uses a simple HTTP API
-            import requests
-            
-            # Test connection
-            response = requests.get("http://localhost:11434/api/tags")
-            
-            if response.status_code == 200:
-                self.model_name = "llama2"  # Default model
-                logger.info(f"Ollama client initialized with model: {self.model_name}")
+            resp = requests.get(f"{base_url}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                self.model_name = settings.ollama_model
+                self.ollama_base_url = base_url
+                logger.info("Ollama client ready", extra={"model": self.model_name, "base_url": base_url})
             else:
-                logger.error("Ollama server not accessible")
-                self.client = None
-        
-        except Exception as e:
-            logger.error(f"Failed to initialize Ollama: {e}")
-            logger.info("Make sure Ollama is running: ollama serve")
+                raise ConnectionError(f"Ollama returned HTTP {resp.status_code}")
+        except Exception as exc:
+            logger.error("Ollama init failed — is `ollama serve` running?", extra={"error": str(exc)})
             self.client = None
-    
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
     def generate_answer(
         self,
         query: str,
         context_docs: List[Dict],
-        conversation_history: List[Dict] = None
+        conversation_history: List[Dict] = None,
     ) -> Dict:
         """
-        Generate an answer using LLM with retrieved context.
-        
+        Generate an answer using the configured LLM.
+
         Args:
-            query: User's question
-            context_docs: Retrieved documents with text and metadata
-            conversation_history: Previous conversation turns
-            
+            query: User's question.
+            context_docs: Retrieved and reranked documents.
+            conversation_history: Previous turns for this session.
+
         Returns:
-            Dictionary with answer and sources
+            dict with keys: answer (str), sources (List[dict]), context_used (int)
         """
-        logger.info(f"Generating answer for query: '{query}'")
-        
-        # Build context from retrieved documents
         context = self._build_context(context_docs)
-        
-        # Build prompt
         prompt = self._build_prompt(query, context, conversation_history)
-        
-        # Generate answer
+
         if self.model_type == "openai":
-            answer = self._generate_openai(prompt, conversation_history)
-        elif self.model_type == "ollama":
-            answer = self._generate_ollama(prompt)
+            answer = self._generate_openai_sync(prompt)
         else:
-            answer = "Error: No LLM configured"
-        
-        # Format sources
+            answer = self._generate_ollama_sync(prompt)
+
         sources = self._format_sources(context_docs)
-        
-        logger.info("Answer generated successfully")
-        
+        logger.info("Answer generated", extra={"sources_count": len(sources)})
+
         return {
-            'answer': answer,
-            'sources': sources,
-            'context_used': len(context_docs)
+            "answer": answer,
+            "sources": sources,
+            "context_used": len(context_docs),
         }
-    
+
+    # ── Context & Prompt builders ─────────────────────────────────────────────
+
     def _build_context(self, context_docs: List[Dict]) -> str:
-        """
-        Build context string from retrieved documents.
-        
-        Args:
-            context_docs: List of document dictionaries
-            
-        Returns:
-            Formatted context string
-        """
         if not context_docs:
             return "No relevant context found."
-        
-        context_parts = []
+        parts = []
         for idx, doc in enumerate(context_docs, 1):
-            text = doc['text']
-            metadata = doc.get('metadata', {})
-            filename = metadata.get('filename', 'Unknown')
-            
-            context_parts.append(f"[Source {idx}: {filename}]\n{text}")
-        
-        return "\n\n".join(context_parts)
-    
+            filename = doc.get("metadata", {}).get("filename", "Unknown")
+            parts.append(f"[Source {idx}: {filename}]\n{doc['text']}")
+        return "\n\n".join(parts)
+
     def _build_prompt(
         self,
         query: str,
         context: str,
-        conversation_history: List[Dict] = None
+        conversation_history: Optional[List[Dict]],
     ) -> str:
-        """
-        Build the prompt for the LLM.
-        
-        Args:
-            query: User's question
-            context: Retrieved context
-            conversation_history: Previous conversation
-            
-        Returns:
-            Formatted prompt
-        """
-        system_message = """You are a helpful assistant that answers questions about product documentation.
-Use the provided context to answer the user's question accurately.
-If the answer is not in the context, say so clearly.
-Always cite your sources using [Source N] notation."""
-        
-        # Add conversation history if available
+        system_message = (
+            "You are a helpful assistant that answers questions about product documentation.\n"
+            "Use the provided context to answer the user's question accurately.\n"
+            "If the answer is not in the context, say so clearly.\n"
+            "Always cite your sources using [Source N] notation."
+        )
+
+        # Include only the last N turns (configurable, not hardcoded)
         history_text = ""
         if conversation_history:
-            history_parts = []
-            for turn in conversation_history[-3:]:  # Last 3 turns
-                history_parts.append(f"User: {turn.get('query', '')}")
-                history_parts.append(f"Assistant: {turn.get('answer', '')}")
-            history_text = "\n".join(history_parts) + "\n\n"
-        
-        prompt = f"""{system_message}
+            turns = conversation_history[-settings.conversation_history_turns :]
+            lines = []
+            for turn in turns:
+                lines.append(f"User: {turn.get('query', '')}")
+                lines.append(f"Assistant: {turn.get('answer', '')}")
+            history_text = "\n".join(lines) + "\n\n"
 
-{history_text}Context:
-{context}
+        return (
+            f"{system_message}\n\n"
+            f"{history_text}"
+            f"Context:\n{context}\n\n"
+            f"Question: {query}\n\n"
+            "Answer:"
+        )
 
-Question: {query}
+    # ── LLM calls ─────────────────────────────────────────────────────────────
 
-Answer:"""
-        
-        return prompt
-    
-    def _generate_openai(
-        self,
-        prompt: str,
-        conversation_history: List[Dict] = None
-    ) -> str:
-        """Generate answer using OpenAI."""
+    def _generate_openai_sync(self, prompt: str) -> str:
+        """Synchronous OpenAI completion (called via run_in_executor in async routes)."""
         if not self.client:
-            return "Error: OpenAI client not initialized. Please set OPENAI_API_KEY."
-        
+            return "Error: OpenAI client is not initialised. Please set OPENAI_API_KEY."
         try:
-            messages = [{"role": "user", "content": prompt}]
-            
             response = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=500
+                messages=[{"role": "user", "content": prompt}],
+                temperature=settings.llm_temperature,
+                max_tokens=settings.llm_max_tokens,
             )
-            
-            answer = response.choices[0].message.content
-            return answer
-        
-        except Exception as e:
-            logger.error(f"OpenAI generation error: {e}")
-            return f"Error generating answer: {str(e)}"
-    
-    def _generate_ollama(self, prompt: str) -> str:
-        """Generate answer using Ollama."""
+            return response.choices[0].message.content
+        except Exception as exc:
+            logger.error("OpenAI generation error", extra={"error": str(exc)})
+            raise
+
+    def _generate_ollama_sync(self, prompt: str) -> str:
+        """Synchronous Ollama completion."""
+        import requests
+
         try:
-            import requests
-            
-            response = requests.post(
-                "http://localhost:11434/api/generate",
+            resp = requests.post(
+                f"{self.ollama_base_url}/api/generate",
                 json={
                     "model": self.model_name,
                     "prompt": prompt,
-                    "stream": False
-                }
+                    "stream": False,
+                },
+                timeout=60,
             )
-            
-            if response.status_code == 200:
-                return response.json()['response']
-            else:
-                return f"Error: Ollama returned status {response.status_code}"
-        
-        except Exception as e:
-            logger.error(f"Ollama generation error: {e}")
-            return f"Error: {str(e)}. Make sure Ollama is running."
-    
-    def _format_sources(self, context_docs: List[Dict]) -> List[str]:
-        """
-        Format source citations.
-        
-        Args:
-            context_docs: Retrieved documents
-            
-        Returns:
-            List of formatted source strings
-        """
+            if resp.status_code == 200:
+                return resp.json()["response"]
+            raise RuntimeError(f"Ollama returned HTTP {resp.status_code}")
+        except Exception as exc:
+            logger.error("Ollama generation error", extra={"error": str(exc)})
+            raise
+
+    # ── Source formatting ──────────────────────────────────────────────────────
+
+    def _format_sources(self, context_docs: List[Dict]) -> List[Dict]:
+        """Return structured source dicts matching the Source Pydantic model."""
         sources = []
         for idx, doc in enumerate(context_docs, 1):
-            metadata = doc.get('metadata', {})
-            filename = metadata.get('filename', 'Unknown')
-            chunk_idx = metadata.get('chunk_index', 0)
-            
-            source = f"[{idx}] {filename} (section {chunk_idx + 1})"
-            sources.append(source)
-        
+            metadata = doc.get("metadata", {})
+            filename = metadata.get("filename", "Unknown")
+            chunk_index = metadata.get("chunk_index", 0)
+            sources.append(
+                {
+                    "citation": f"[{idx}] {filename} (section {chunk_index + 1})",
+                    "filename": filename,
+                    "chunk_index": chunk_index,
+                }
+            )
         return sources
